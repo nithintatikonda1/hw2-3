@@ -62,17 +62,16 @@ __global__ void compute_bin_counts_gpu(particle_t* particles, int num_parts, int
 
 }
 
-__global__ void compute_bins_gpu(particle_t* particles, int num_parts, int total_num_threads, double bin_size, int num_bins_x, int* bins_gpu, int* bin_counters_gpu) {
+__global__ void compute_bins_gpu(particle_t* particles, int num_parts, int total_num_threads, double bin_size, int num_bins_x, int* bins_gpu, int* bin_counters_gpu, int* bin_indices_gpu) {
     int tid = threadIdx.x + blockIdx.x * blockDim.x;
 
     // Compute place particles in bin
     for (int i = tid; i < num_parts; i += total_num_threads) {
-        int bin_start_index = get_bin_index_gpu(particles[i], bin_size, num_bins_x);
-        int count = atomicAdd(&bin_counters_gpu[bin_start_index], 1);
-        int particle_index = bin_start_index + count;
+        int bin_index = get_bin_index_gpu(particles[i], bin_size, num_bins_x);
+        int count = atomicAdd(&bin_counters_gpu[bin_index], 1);
+        int particle_index = bin_indices_gpu[bin_index] + count;
         bins_gpu[particle_index] = i; 
     }
-
 }
 
 __global__ void compute_forces_gpu(particle_t* particles, int num_parts, int total_num_threads, double bin_size, int num_bins_x, int num_bins_y, int* bins_gpu, int*bin_indices_gpu) {
@@ -161,8 +160,8 @@ void init_simulation(particle_t* parts, int num_parts, double size) {
     num_bins_y = size / bin_size + 1;
     num_bins = num_bins_x * num_bins_y;
 
-    cudaMalloc((void **)&bin_indices_gpu, sizeof(int) * num_bins + 1);
-    cudaMalloc((void **)&bin_counters_gpu, sizeof(int) * num_bins + 1);
+    cudaMalloc((void **)&bin_indices_gpu, sizeof(int) * (num_bins + 1));
+    cudaMalloc((void **)&bin_counters_gpu, sizeof(int) * (num_bins + 1));
     cudaMalloc((void **)&bins_gpu, sizeof(int) * num_parts);
 
 }
@@ -180,7 +179,7 @@ void simulate_one_step(particle_t* parts, int num_parts, double size) {
     thrust::exclusive_scan(bin_counts_gpu_ptr, bin_counts_gpu_ptr + num_bins + 1, bin_counts_gpu_ptr);
 
     // Add particles to bins
-    compute_bins_gpu<<<blks, NUM_THREADS>>>(parts, num_parts, total_num_threads, bin_size, num_bins_x, bins_gpu, bin_counters_gpu);
+    compute_bins_gpu<<<blks, NUM_THREADS>>>(parts, num_parts, total_num_threads, bin_size, num_bins_x, bins_gpu, bin_counters_gpu, bin_indices_gpu);
 
     // Compute forces
     compute_forces_gpu<<<blks, NUM_THREADS>>>(parts, num_parts, total_num_threads, bin_size, num_bins_x, num_bins_y, bins_gpu, bin_indices_gpu);
