@@ -3,7 +3,8 @@
 #include <thrust/scan.h>
 #include <thrust/device_ptr.h>
 
-#define NUM_THREADS 256
+#define NUM_THREADS 256 // Threads per block (optimized for A100)
+#define MAX_PARTICLES_PER_BLOCK 2048 // Adjusted for A100's shared memory capacity
 
 // Put any static global variables here that you will use throughout the simulation.
 int blks;
@@ -22,13 +23,10 @@ __device__ void apply_force_gpu(particle_t& particle, particle_t& neighbor) {
     double r2 = dx * dx + dy * dy;
     if (r2 > cutoff * cutoff)
         return;
-    // r2 = fmax( r2, min_r*min_r );
     r2 = (r2 > min_r * min_r) ? r2 : min_r * min_r;
     double r = sqrt(r2);
 
-    //
-    //  very simple short-range repulsive force
-    //
+    // Very simple short-range repulsive force
     double coef = (1 - cutoff / r) / r2 / mass;
     particle.ax += coef * dx;
     particle.ay += coef * dy;
@@ -74,24 +72,44 @@ __global__ void compute_bins_gpu(particle_t* particles, int num_parts, int total
     }
 }
 
-__global__ void compute_forces_gpu(particle_t* particles, int num_parts, int total_num_threads, double bin_size, int num_bins_x, int num_bins_y, int* bins_gpu, int*bin_indices_gpu) {
-    // Get thread (particle) ID
-    int tid = threadIdx.x + blockIdx.x * blockDim.x;
+__global__ void compute_forces_gpu(particle_t* particles, int num_parts, double bin_size, int num_bins_x, int num_bins_y, int* bins_gpu, int* bin_indices_gpu) {
+    // Shared memory for particles in the current block
+    __shared__ particle_t shared_particles[MAX_PARTICLES_PER_BLOCK];
 
-    // Each thread gets assigned particles
-    for (int i = tid; i < num_parts; i += total_num_threads) {
-        particle_t& particle = particles[i];
+    // Get thread and block indices
+    int tid = threadIdx.x + threadIdx.y * blockDim.x;
+    int block_x = blockIdx.x;
+    int block_y = blockIdx.y;
 
-        // zero out accelerations
+    // Compute the bin index for this block
+    int bin_x = block_x;
+    int bin_y = block_y;
+    int bin_index = bin_x + num_bins_x * bin_y;
+
+    // Load particles from the current bin into shared memory
+    int bin_start_index = bin_indices_gpu[bin_index];
+    int bin_end_index = bin_indices_gpu[bin_index + 1];
+    int num_particles_in_bin = bin_end_index - bin_start_index;
+
+    for (int i = tid; i < num_particles_in_bin; i += blockDim.x * blockDim.y) {
+        shared_particles[i] = particles[bins_gpu[bin_start_index + i]];
+    }
+    __syncthreads(); // Ensure all threads finish loading
+
+    // Each thread processes one particle in the current bin
+    for (int i = tid; i < num_particles_in_bin; i += blockDim.x * blockDim.y) {
+        particle_t& particle = shared_particles[i];
+
+        // Zero out accelerations
         particle.ax = 0;
         particle.ay = 0;
 
-        // Compute bin indices
-        int bin_x = particle.x / bin_size;
-        int bin_y = particle.y / bin_size;
-        int bin_index = get_bin_index_gpu(particle, bin_size, num_bins_x);
+        // Compute forces with particles in the same bin
+        for (int j = 0; j < num_particles_in_bin; j++) {
+            apply_force_gpu(particle, shared_particles[j]);
+        }
 
-        // Explore neighboring bins
+        // Compute forces with particles in neighboring bins
         for (int dx = -1; dx <= 1; dx++) {
             for (int dy = -1; dy <= 1; dy++) {
                 int neighbor_bin_x = bin_x + dx;
@@ -100,19 +118,21 @@ __global__ void compute_forces_gpu(particle_t* particles, int num_parts, int tot
                 // Skip if bins are out of bounds
                 if (neighbor_bin_x < 0 || neighbor_bin_x >= num_bins_x ||
                     neighbor_bin_y < 0 || neighbor_bin_y >= num_bins_y) {
-                        continue;
+                    continue;
                 }
 
-                // Compute forces for all neighbors in bin.
                 int neighbor_bin_index = neighbor_bin_x + num_bins_x * neighbor_bin_y;
-                int bin_start_index = bin_indices_gpu[neighbor_bin_index];
-                int bin_end_index = bin_indices_gpu[neighbor_bin_index + 1];
-                for (int i = bin_start_index; i < bin_end_index; i++) {
-                    int neighbor_index = bins_gpu[i];
-                    apply_force_gpu(particle, particles[neighbor_index]);
+                int neighbor_bin_start_index = bin_indices_gpu[neighbor_bin_index];
+                int neighbor_bin_end_index = bin_indices_gpu[neighbor_bin_index + 1];
+
+                for (int k = neighbor_bin_start_index; k < neighbor_bin_end_index; k++) {
+                    apply_force_gpu(particle, particles[bins_gpu[k]]);
                 }
             }
         }
+
+        // Write updated particle back to global memory
+        particles[bins_gpu[bin_start_index + i]] = particle;
     }
 }
 
@@ -168,7 +188,6 @@ void init_simulation(particle_t* parts, int num_parts, double size) {
 
 void simulate_one_step(particle_t* parts, int num_parts, double size) {
     // parts live in GPU memory
-    // Rewrite this function
 
     // Find the number of particles in each bin
     zero_out_bin_counts<<<blks, NUM_THREADS>>>(bin_indices_gpu, bin_counters_gpu, num_bins, total_num_threads);
@@ -181,9 +200,10 @@ void simulate_one_step(particle_t* parts, int num_parts, double size) {
     // Add particles to bins
     compute_bins_gpu<<<blks, NUM_THREADS>>>(parts, num_parts, total_num_threads, bin_size, num_bins_x, bins_gpu, bin_counters_gpu, bin_indices_gpu);
 
-    // Compute forces
-    compute_forces_gpu<<<blks, NUM_THREADS>>>(parts, num_parts, total_num_threads, bin_size, num_bins_x, num_bins_y, bins_gpu, bin_indices_gpu);
-
+    // Compute forces using shared memory optimization
+    dim3 threadsPerBlock(16, 16); // 16x16 threads per block
+    dim3 numBlocks((num_bins_x + 15) / 16, (num_bins_y + 15) / 16); // 2D grid of blocks
+    compute_forces_gpu<<<numBlocks, threadsPerBlock>>>(parts, num_parts, bin_size, num_bins_x, num_bins_y, bins_gpu, bin_indices_gpu);
 
     // Move particles
     move_gpu<<<blks, NUM_THREADS>>>(parts, num_parts, size);
