@@ -5,4 +5,4 @@
 #SBATCH -t 00:30:00
 #SBATCH --gpus-per-node=4
 
-./gpu
+./gpu -n 10000000
