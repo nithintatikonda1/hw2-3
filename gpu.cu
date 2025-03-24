@@ -16,8 +16,10 @@
 
 // Put any static global variables here that you will use throughout the simulation.
 int blks;              // Number of blocks for CUDA kernel launches
-int* bin_indices_gpu;  // Device array storing the number of particles in each bin (after scan this will be converted to the starting index of each bin)
-int* bin_counters_gpu; // Device array storing count of particles in each bin while computing bin counts
+int* bin_indices_gpu;  // Device array storing the number of particles in each bin (after scan this
+                       // will be converted to the starting index of each bin)
+int* bin_counters_gpu; // Device array storing count of particles in each bin while computing bin
+                       // counts
 int* bins_gpu;         // Device array storing particles grouped by bin
 double bin_size;       // Size of each spatial bin for neighbor search
 int num_bins_x;        // Number of bins in x dimension
@@ -75,9 +77,9 @@ __global__ void zero_out_bin_counts(int* bin_indices_gpu, int* bin_counters_gpu,
      * Zero out the bin counts and set the bin starting indices to 0 on the GPU.
      *
      * Parameters:
-     *   bin_indices_gpu: Array storing the number of particles in each bin (after scan this will be converted to the starting index of each bin)
-     *   bin_counters_gpu: Array storing the count of particles in each bin while computing bin counts
-     *   num_bins: Total number of bins
+     *   bin_indices_gpu: Array storing the number of particles in each bin (after scan this will be
+     * converted to the starting index of each bin) bin_counters_gpu: Array storing the count of
+     * particles in each bin while computing bin counts num_bins: Total number of bins
      *   total_num_threads: Total number of threads being used
      */
     int tid = threadIdx.x + blockIdx.x * blockDim.x;
@@ -100,7 +102,8 @@ __global__ void compute_bin_counts_gpu(particle_t* particles, int num_parts, int
      *   total_num_threads: Total number of threads being used
      *   bin_size: The size of each bin in the grid
      *   num_bins_x: The number of bins in the x direction
-     *   bin_indices_gpu: Array storing the number of particles in each bin (after scan this will be converted to the starting index of each bin)
+     *   bin_indices_gpu: Array storing the number of particles in each bin (after scan this will be
+     * converted to the starting index of each bin)
      */
     int tid = threadIdx.x + blockIdx.x * blockDim.x;
 
@@ -132,45 +135,42 @@ __global__ void compute_bins_gpu(particle_t* particles, int num_parts, int total
     // Compute place particles in bin
     for (int i = tid; i < num_parts; i += total_num_threads) {
         int bin_index = get_bin_index_gpu(particles[i], bin_size, num_bins_x);
-        int count = atomicAdd(&bin_counters_gpu[bin_index], 1);  // Amount of particles that have already been added to the bin
+        int count = atomicAdd(&bin_counters_gpu[bin_index],
+                              1); // Amount of particles that have already been added to the bin
         int particle_index = bin_indices_gpu[bin_index] + count;
         bins_gpu[particle_index] = i;
     }
 }
 
-__global__ void compute_forces_gpu(particle_t* particles, int num_parts, int total_num_threads,
-                                   double bin_size, int num_bins_x, int num_bins_y, int* bins_gpu,
+__global__ void compute_forces_gpu(particle_t* particles, int num_parts, double bin_size,
+                                   int num_bins_x, int num_bins_y, int* bins_gpu,
                                    int* bin_indices_gpu) {
-    /*
-     * Compute forces between particles using GPU binning for optimization.
-     * Each thread processes a subset of particles and computes forces with particles in neighboring
-     * bins.
-     *
-     * Parameters:
-     *   particles: Array of particles in GPU memory
-     *   num_parts: Total number of particles
-     *   total_num_threads: Total number of GPU threads being used
-     *   bin_size: Size of each spatial bin
-     *   num_bins_x: Number of bins in x direction
-     *   num_bins_y: Number of bins in y direction
-     *   bins_gpu: Array containing particle indices sorted into bins
-     *   bin_indices_gpu: Array containing starting index for each bin
-     */
-    // Get thread (particle) ID
-    int tid = threadIdx.x + blockIdx.x * blockDim.x;
+    // Get thread ID
+    int local_tid = threadIdx.x;
+    int block_start = blockIdx.x * blockDim.x;
+    int particle_idx = block_start + local_tid;
 
-    // Each thread gets assigned particles
-    for (int i = tid; i < num_parts; i += total_num_threads) {
-        particle_t& particle = particles[i];
+    // Shared memory for caching particles in this tile
+    extern __shared__ particle_t shared_particles[];
 
-        // zero out accelerations
-        particle.ax = 0;
-        particle.ay = 0;
+    // Collaboratively load the entire tile of particles into shared memory
+    if (particle_idx < num_parts) {
+        shared_particles[local_tid] = particles[particle_idx];
+    }
 
-        // Compute bin indices
-        int bin_x = particle.x / bin_size;
-        int bin_y = particle.y / bin_size;
-        int bin_index = get_bin_index_gpu(particle, bin_size, num_bins_x);
+    __syncthreads(); // Make sure all particles are loaded
+
+    // Each thread processes exactly one particle (tiled approach)
+    if (particle_idx < num_parts) {
+        particle_t& my_particle = shared_particles[local_tid];
+
+        // Zero out accelerations
+        double ax = 0;
+        double ay = 0;
+
+        // Compute bin indices for this particle
+        int bin_x = my_particle.x / bin_size;
+        int bin_y = my_particle.y / bin_size;
 
         // Explore neighboring bins
         for (int dx = -1; dx <= 1; dx++) {
@@ -184,16 +184,62 @@ __global__ void compute_forces_gpu(particle_t* particles, int num_parts, int tot
                     continue;
                 }
 
-                // Compute forces for all neighbors in bin.
+                // Compute forces for all neighbors in bin
                 int neighbor_bin_index = neighbor_bin_x + num_bins_x * neighbor_bin_y;
-                int bin_start_index = bin_indices_gpu[neighbor_bin_index];
-                int bin_end_index = bin_indices_gpu[neighbor_bin_index + 1];
-                for (int i = bin_start_index; i < bin_end_index; i++) {
-                    int neighbor_index = bins_gpu[i];
-                    apply_force_gpu(particle, particles[neighbor_index]);
+                int bin_start = bin_indices_gpu[neighbor_bin_index];
+                int bin_end = bin_indices_gpu[neighbor_bin_index + 1];
+
+                // Process all particles in this neighboring bin
+                for (int j = bin_start; j < bin_end; j++) {
+                    int neighbor_idx = bins_gpu[j];
+
+                    // Check if neighbor is in our tile (shared memory)
+                    bool in_tile = (neighbor_idx >= block_start) &&
+                                   (neighbor_idx < block_start + blockDim.x) &&
+                                   (neighbor_idx < num_parts);
+
+                    if (in_tile) {
+                        // Use shared memory
+                        particle_t& neighbor = shared_particles[neighbor_idx - block_start];
+
+                        double dx = neighbor.x - my_particle.x;
+                        double dy = neighbor.y - my_particle.y;
+                        double r2 = dx * dx + dy * dy;
+
+                        if (r2 > cutoff * cutoff)
+                            continue;
+
+                        r2 = (r2 > min_r * min_r) ? r2 : min_r * min_r;
+                        double r = sqrt(r2);
+                        double coef = (1 - cutoff / r) / r2 / mass;
+
+                        ax += coef * dx;
+                        ay += coef * dy;
+                    } else {
+                        // Use global memory
+                        particle_t& neighbor = particles[neighbor_idx];
+
+                        double dx = neighbor.x - my_particle.x;
+                        double dy = neighbor.y - my_particle.y;
+                        double r2 = dx * dx + dy * dy;
+
+                        if (r2 > cutoff * cutoff)
+                            continue;
+
+                        r2 = (r2 > min_r * min_r) ? r2 : min_r * min_r;
+                        double r = sqrt(r2);
+                        double coef = (1 - cutoff / r) / r2 / mass;
+
+                        ax += coef * dx;
+                        ay += coef * dy;
+                    }
                 }
             }
         }
+
+        // Write back acceleration values
+        particles[particle_idx].ax = ax;
+        particles[particle_idx].ay = ay;
     }
 }
 
@@ -282,8 +328,10 @@ void simulate_one_step(particle_t* parts, int num_parts, double size) {
     cudaEventRecord(start2, 0);
 #endif
     thrust::device_ptr<int> bin_counts_gpu_ptr(bin_indices_gpu);
-    thrust::exclusive_scan(bin_counts_gpu_ptr, bin_counts_gpu_ptr + num_bins + 1,
-                           bin_counts_gpu_ptr);  // This will convert bin_indices_gpu from the number of particles in each bin to the starting index of each bin
+    thrust::exclusive_scan(
+        bin_counts_gpu_ptr, bin_counts_gpu_ptr + num_bins + 1,
+        bin_counts_gpu_ptr); // This will convert bin_indices_gpu from the number of particles in
+                             // each bin to the starting index of each bin
 #ifdef BENCHMARK
     cudaEventRecord(stop2, 0);
     cudaEventSynchronize(stop2);
@@ -303,12 +351,16 @@ void simulate_one_step(particle_t* parts, int num_parts, double size) {
     cudaEventElapsedTime(&assignment_time, start3, stop3);
 #endif
 
+    // Calculate number of thread blocks needed for tiled approach
+    int tiled_blocks = (num_parts + NUM_THREADS - 1) / NUM_THREADS;
+    size_t shared_mem_size = NUM_THREADS * sizeof(particle_t);
+
 // Compute forces and move particles
 #ifdef BENCHMARK
     cudaEventRecord(start4, 0);
 #endif
-    compute_forces_gpu<<<blks, NUM_THREADS>>>(parts, num_parts, total_num_threads, bin_size,
-                                              num_bins_x, num_bins_y, bins_gpu, bin_indices_gpu);
+    compute_forces_gpu<<<tiled_blocks, NUM_THREADS, shared_mem_size>>>(
+        parts, num_parts, bin_size, num_bins_x, num_bins_y, bins_gpu, bin_indices_gpu);
     move_gpu<<<blks, NUM_THREADS>>>(parts, num_parts, size);
 #ifdef BENCHMARK
     cudaEventRecord(stop4, 0);
