@@ -16,6 +16,8 @@
 
 // Put any static global variables here that you will use throughout the simulation.
 int blks;              // Number of blocks for CUDA kernel launches
+int tiled_blocks;      // Number of blocks for tiled approach
+size_t shared_mem_size; // Size of shared memory for caching particles in this tile
 int* bin_indices_gpu;  // Device array storing the number of particles in each bin (after scan this
                        // will be converted to the starting index of each bin)
 int* bin_counters_gpu; // Device array storing count of particles in each bin while computing bin
@@ -134,7 +136,7 @@ __global__ void compute_bins_gpu(particle_t* particles, int num_parts, int total
      */
     int tid = threadIdx.x + blockIdx.x * blockDim.x;
 
-    // Compute place particles in bin
+        // Compute place particles in bin
     #pragma unroll 2
     for (int i = tid; i < num_parts; i += total_num_threads) {
         int bin_index = get_bin_index_gpu(particles[i], bin_size, num_bins_x);
@@ -190,7 +192,8 @@ __global__ void compute_forces_gpu(particle_t* particles, int num_parts, double 
                 if (__all_sync(__activemask(), !valid_bin))
                     continue;
 
-                // Only process valid bins (threads for invalid bins will just execute without effect)
+                // Only process valid bins (threads for invalid bins will just execute without
+                // effect)
                 int neighbor_bin_index =
                     valid_bin ? (neighbor_bin_x + num_bins_x * neighbor_bin_y) : 0;
 
@@ -208,11 +211,11 @@ __global__ void compute_forces_gpu(particle_t* particles, int num_parts, double 
                                    (neighbor_idx < num_parts);
 
                     double nx, ny;
-                    if (in_tile) {  // Shared memory
+                    if (in_tile) { // Shared memory
                         particle_t& neighbor = shared_particles[neighbor_idx - block_start];
                         nx = neighbor.x;
                         ny = neighbor.y;
-                    } else {  // Global memory
+                    } else { // Global memory
                         particle_t& neighbor = particles[neighbor_idx];
                         nx = neighbor.x;
                         ny = neighbor.y;
@@ -286,6 +289,8 @@ void init_simulation(particle_t* parts, int num_parts, double size) {
 
     blks = (num_parts + NUM_THREADS - 1) / NUM_THREADS;
     total_num_threads = blks * NUM_THREADS;
+    tiled_blocks = (num_parts + NUM_THREADS - 1) / NUM_THREADS;
+    shared_mem_size = NUM_THREADS * sizeof(particle_t);
 
     bin_size = cutoff;
     num_bins_x = size / bin_size + 1;
@@ -355,10 +360,6 @@ void simulate_one_step(particle_t* parts, int num_parts, double size) {
     cudaEventSynchronize(stop3);
     cudaEventElapsedTime(&assignment_time, start3, stop3);
 #endif
-
-    // Calculate number of thread blocks needed for tiled approach
-    int tiled_blocks = (num_parts + NUM_THREADS - 1) / NUM_THREADS;
-    size_t shared_mem_size = NUM_THREADS * sizeof(particle_t);
 
 // Compute forces and move particles
 #ifdef BENCHMARK
