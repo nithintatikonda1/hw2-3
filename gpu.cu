@@ -173,21 +173,26 @@ __global__ void compute_forces_gpu(particle_t* particles, int num_parts, double 
         int bin_y = my_particle.y / bin_size;
 
         // Explore neighboring bins
-        for (int dx = -1; dx <= 1; dx++) {
-            for (int dy = -1; dy <= 1; dy++) {
+        for (int dy = -1; dy <= 1; dy++) {
+            for (int dx = -1; dx <= 1; dx++) {
                 int neighbor_bin_x = bin_x + dx;
                 int neighbor_bin_y = bin_y + dy;
 
-                // Skip if bins are out of bounds
-                if (neighbor_bin_x < 0 || neighbor_bin_x >= num_bins_x || neighbor_bin_y < 0 ||
-                    neighbor_bin_y >= num_bins_y) {
-                    continue;
-                }
+                // Skip if bins are out of bounds (using mask to avoid divergence)
+                bool valid_bin = (neighbor_bin_x >= 0 && neighbor_bin_x < num_bins_x &&
+                                  neighbor_bin_y >= 0 && neighbor_bin_y < num_bins_y);
 
-                // Compute forces for all neighbors in bin
-                int neighbor_bin_index = neighbor_bin_x + num_bins_x * neighbor_bin_y;
-                int bin_start = bin_indices_gpu[neighbor_bin_index];
-                int bin_end = bin_indices_gpu[neighbor_bin_index + 1];
+                // Early exit without branching (for entire warp)
+                if (__all_sync(__activemask(), !valid_bin))
+                    continue;
+
+                // Only process valid bins (threads for invalid bins will just execute without
+                // effect)
+                int neighbor_bin_index =
+                    valid_bin ? (neighbor_bin_x + num_bins_x * neighbor_bin_y) : 0;
+
+                int bin_start = valid_bin ? bin_indices_gpu[neighbor_bin_index] : 0;
+                int bin_end = valid_bin ? bin_indices_gpu[neighbor_bin_index + 1] : 0;
 
                 // Process all particles in this neighboring bin
                 for (int j = bin_start; j < bin_end; j++) {
@@ -198,41 +203,37 @@ __global__ void compute_forces_gpu(particle_t* particles, int num_parts, double 
                                    (neighbor_idx < block_start + blockDim.x) &&
                                    (neighbor_idx < num_parts);
 
-                    if (in_tile) {
-                        // Use shared memory
+                    double nx, ny;
+                    if (in_tile) {  // Shared memory
                         particle_t& neighbor = shared_particles[neighbor_idx - block_start];
-
-                        double dx = neighbor.x - my_particle.x;
-                        double dy = neighbor.y - my_particle.y;
-                        double r2 = dx * dx + dy * dy;
-
-                        if (r2 > cutoff * cutoff)
-                            continue;
-
-                        r2 = (r2 > min_r * min_r) ? r2 : min_r * min_r;
-                        double r = sqrt(r2);
-                        double coef = (1 - cutoff / r) / r2 / mass;
-
-                        ax += coef * dx;
-                        ay += coef * dy;
-                    } else {
-                        // Use global memory
+                        nx = neighbor.x;
+                        ny = neighbor.y;
+                    } else {  // Global memory
                         particle_t& neighbor = particles[neighbor_idx];
-
-                        double dx = neighbor.x - my_particle.x;
-                        double dy = neighbor.y - my_particle.y;
-                        double r2 = dx * dx + dy * dy;
-
-                        if (r2 > cutoff * cutoff)
-                            continue;
-
-                        r2 = (r2 > min_r * min_r) ? r2 : min_r * min_r;
-                        double r = sqrt(r2);
-                        double coef = (1 - cutoff / r) / r2 / mass;
-
-                        ax += coef * dx;
-                        ay += coef * dy;
+                        nx = neighbor.x;
+                        ny = neighbor.y;
                     }
+
+                    // Calculate force using masked operations to avoid divergence
+                    double dx = nx - my_particle.x;
+                    double dy = ny - my_particle.y;
+                    double r2 = dx * dx + dy * dy;
+
+                    // Instead of branch: if (r2 > cutoff * cutoff) continue;
+                    double mask = (r2 <= cutoff * cutoff) ? 1.0 : 0.0;
+                    // Skip self interactions
+                    mask *= (r2 >= 1e-9) ? 1.0 : 0.0;
+
+                    // Apply minimum r2 without branching
+                    r2 = (r2 > min_r * min_r) ? r2 : min_r * min_r;
+                    double r = sqrt(r2);
+
+                    // Calculate coefficient - multiply by mask to zero out particles beyond cutoff
+                    double coef = mask * (1 - cutoff / r) / r2 / mass;
+
+                    // Update accelerations
+                    ax += coef * dx;
+                    ay += coef * dy;
                 }
             }
         }
