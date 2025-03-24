@@ -85,6 +85,7 @@ __global__ void zero_out_bin_counts(int* bin_indices_gpu, int* bin_counters_gpu,
     int tid = threadIdx.x + blockIdx.x * blockDim.x;
 
     // Set # particles currently in bin to 0 and set bin starting indices to 0
+    #pragma unroll 4
     for (int i = tid; i < num_bins + 1; i += total_num_threads) {
         bin_indices_gpu[i] = 0;
         bin_counters_gpu[i] = 0;
@@ -108,6 +109,7 @@ __global__ void compute_bin_counts_gpu(particle_t* particles, int num_parts, int
     int tid = threadIdx.x + blockIdx.x * blockDim.x;
 
     // Compute bin counts
+    #pragma unroll 2
     for (int i = tid; i < num_parts; i += total_num_threads) {
         int bin_index = get_bin_index_gpu(particles[i], bin_size, num_bins_x);
         atomicAdd(&(bin_indices_gpu[bin_index]), 1);
@@ -133,6 +135,7 @@ __global__ void compute_bins_gpu(particle_t* particles, int num_parts, int total
     int tid = threadIdx.x + blockIdx.x * blockDim.x;
 
     // Compute place particles in bin
+    #pragma unroll 2
     for (int i = tid; i < num_parts; i += total_num_threads) {
         int bin_index = get_bin_index_gpu(particles[i], bin_size, num_bins_x);
         int count = atomicAdd(&bin_counters_gpu[bin_index],
@@ -174,6 +177,7 @@ __global__ void compute_forces_gpu(particle_t* particles, int num_parts, double 
 
         // Explore neighboring bins
         for (int dy = -1; dy <= 1; dy++) {
+            #pragma unroll 3
             for (int dx = -1; dx <= 1; dx++) {
                 int neighbor_bin_x = bin_x + dx;
                 int neighbor_bin_y = bin_y + dy;
@@ -186,15 +190,15 @@ __global__ void compute_forces_gpu(particle_t* particles, int num_parts, double 
                 if (__all_sync(__activemask(), !valid_bin))
                     continue;
 
-                // Only process valid bins (threads for invalid bins will just execute without
-                // effect)
+                // Only process valid bins (threads for invalid bins will just execute without effect)
                 int neighbor_bin_index =
                     valid_bin ? (neighbor_bin_x + num_bins_x * neighbor_bin_y) : 0;
 
                 int bin_start = valid_bin ? bin_indices_gpu[neighbor_bin_index] : 0;
                 int bin_end = valid_bin ? bin_indices_gpu[neighbor_bin_index + 1] : 0;
 
-                // Process all particles in this neighboring bin
+                // Process particles in neighboring bin
+                #pragma unroll 4
                 for (int j = bin_start; j < bin_end; j++) {
                     int neighbor_idx = bins_gpu[j];
 
