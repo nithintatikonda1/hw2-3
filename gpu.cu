@@ -4,7 +4,7 @@
 #include <thrust/scan.h>
 
 // Enable benchmarking to measure kernel execution times
-#define BENCHMARK 1
+// #define BENCHMARK 1
 
 #define NUM_THREADS 256
 // Constants for A100 GPU
@@ -304,8 +304,10 @@ void init_simulation(particle_t* parts, int num_parts, double size) {
 
 void simulate_one_step(particle_t* parts, int num_parts, double size) {
     // parts live in GPU memory
+#ifdef BENCHMARK
     cudaEvent_t start1, stop1, start2, stop2, start3, stop3, start4, stop4;
     float binning_time, scan_time, assignment_time, compute_time;
+#endif
 
 #ifdef BENCHMARK
     // Create timing events
